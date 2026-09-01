@@ -87,6 +87,10 @@ inputs:
     description: 'The API level of the Android emulator to run against'
     required: true
     default: 28
+  compile-sdk-api-level:
+    description: 'The Android API level for the compile SDK build triple (defaults to android-api-level)'
+    required: false
+    default: ''
   android-channel:
     required: false
     type: string
@@ -235,6 +239,10 @@ runs:
           # trim the preceeding "swift-" from the beginning, because
           # we add it back in the SWIFT_VERSION_ID
           SWIFT_VERSION="${snapshot_tag//swift-/}"
+        elif [[ "${SWIFT_VERSION}" == *-DEVELOPMENT-SNAPSHOT-* || "${SWIFT_VERSION}" == DEVELOPMENT-SNAPSHOT-* ]]; then
+          # use the exact development snapshot version as-is, without looking it up in the releases file
+          # e.g. "6.3-DEVELOPMENT-SNAPSHOT-2025-12-07-a" or "DEVELOPMENT-SNAPSHOT-2025-12-07-a"
+          log "Using explicit development snapshot: ${SWIFT_VERSION}"
         elif [[ "${SWIFT_VERSION}" == 6.2* ]]; then
           # match "6.0" to "6.0.3"
           # DO NOT match "6.1" to "6.1-DEVELOPMENT-SNAPSHOT-2025-03-07-a"
@@ -401,8 +409,13 @@ runs:
             SWIFT_SDK_VERSION="0.1"
             SWIFT_SDK_ID="${{ steps.setup.outputs.swift-id }}"
 
-            # Swift Android SDK 6.1.1+ targets API 28+
-            SWIFT_SDK_ANROID_API="28"
+            # Determine the compile SDK API level (defaults to android-api-level)
+            COMPILE_SDK_API_LEVEL_EXPLICIT="${{ inputs.compile-sdk-api-level }}"
+            if [[ -z "${COMPILE_SDK_API_LEVEL_EXPLICIT}" ]]; then
+              SWIFT_SDK_ANROID_API="${{ inputs.android-api-level }}"
+            else
+              SWIFT_SDK_ANROID_API="${COMPILE_SDK_API_LEVEL_EXPLICIT}"
+            fi
 
             # TODO: get this from the API's "download" property from
             # https://www.swift.org/api/v1/install/dev/main/android-sdk.json
@@ -413,7 +426,10 @@ runs:
             # 6.0.x-6.1 (but not 6.1.1)
             if [[ "${SWIFT_SDK_ID}" =~ "-6.0" || "${SWIFT_SDK_ID}" =~ "-6.1-" ]]; then
               # Swift Android SDK 6.0/6.1 targets API 24+
-              SWIFT_SDK_ANROID_API="24"
+              # only override the API if the user did not explicitly set compile-sdk-api-level
+              if [[ -z "${COMPILE_SDK_API_LEVEL_EXPLICIT}" ]]; then
+                SWIFT_SDK_ANROID_API="24"
+              fi
               SWIFT_SDK_ARTIFACT="${SWIFT_SDK_ID}-android-${SWIFT_SDK_ANROID_API}-${SWIFT_SDK_VERSION}"
               ANDROID_SDK_URL="https://github.com/skiptools/swift-android-toolchain/releases/download/${{ steps.setup.outputs.swift-version }}/${SWIFT_SDK_ARTIFACT}.artifactbundle.tar.gz"
             elif [[ "${SWIFT_SDK_ID}" =~ "-6.1." || "${SWIFT_SDK_ID}" =~ "-6.2" ]]; then
@@ -602,7 +618,19 @@ runs:
             # see: https://github.com/swiftlang/swift-package-manager/blob/1b593469e8ad3daf2cc10e798340bd2de68c402d/Sources/Commands/SwiftTestCommand.swift#L1542
             patchelf --print-needed ${XCTEST} | grep libTesting.so && TEST_SHELL="${TEST_SHELL} && ${TEST_CMD} --testing-library swift-testing && [ \$? -eq 0 ] || [ \$? -eq 69 ]" || true
           fi
-          echo "adb shell '${TEST_SHELL}'" >> ${SCRIPT_FILE}
+          if [ "${{ inputs.android-api-level }}" -le 23 ]; then
+            # On API 23 the exit code from `adb shell` does not get propagated back to the host, so a
+            # failing test run would still pass the job. Instead, write the run's exit code to a file
+            # on the device (TEST_SHELL already collapses to 0 for pass/no-tests, non-zero for
+            # failure), read it back over adb (stdout is forwarded fine), and fail the host script if
+            # it is not 0.
+            REMOTE_RC_FILE="${REMOTE_FOLDER}/${TEST_BASE_FOLDER}/xctest-exit-code"
+            echo "adb shell '${TEST_SHELL}; echo \$? > ${REMOTE_RC_FILE}'" >> ${SCRIPT_FILE}
+            echo "RC=\$(adb shell cat ${REMOTE_RC_FILE} | tr -d '\\r')" >> ${SCRIPT_FILE}
+            echo "[ \"\$RC\" = 0 ] || { echo \"::error::Android tests failed (exit \$RC)\"; exit 1; }" >> ${SCRIPT_FILE}
+          else
+            echo "adb shell '${TEST_SHELL}'" >> ${SCRIPT_FILE}
+          fi
         done
 
         # ensure the emulator stops when we are done
